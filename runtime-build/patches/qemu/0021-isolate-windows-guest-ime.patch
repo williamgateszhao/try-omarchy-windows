@@ -1,0 +1,153 @@
+diff --git a/ui/meson.build b/ui/meson.build
+index 69404bca71..61dfbf6a84 100644
+--- a/ui/meson.build
++++ b/ui/meson.build
+@@ -121,6 +121,9 @@ endif
+ 
+ if sdl.found()
+   sdl_ss = ss.source_set()
++  if host_os == 'windows'
++    sdl_ss.add(cc.find_library('imm32'))
++  endif
+   sdl_ss.add(sdl, sdl_image, pixman, glib, files(
+     'sdl2-2d.c',
+     'sdl2-input.c',
+diff --git a/ui/sdl2.c b/ui/sdl2.c
+index 5af2a45c76..c555db3619 100644
+--- a/ui/sdl2.c
++++ b/ui/sdl2.c
+@@ -35,6 +35,10 @@
+ #include "qemu/log.h"
+ #include "qemu-main.h"
+ #include "qapi/qapi-events-ui.h"
++
++#ifdef _WIN32
++#include <imm.h>
++#endif
+ #include "sdl2-pinch-win32.h"
+ 
+ #ifdef CONFIG_X11
+@@ -70,6 +74,10 @@ static Notifier mouse_mode_notifier;
+ 
+ static void sdl_update_caption(struct sdl2_console *scon);
+ 
++#ifdef _WIN32
++static void sdl2_win32_disable_ime(struct sdl2_console *scon);
++#endif
++
+ static struct sdl2_console *get_scon_from_window(uint32_t window_id)
+ {
+     int i;
+@@ -106,6 +114,10 @@ void sdl2_window_create(struct sdl2_console *scon)
+     if (scon->hidden) {
+         flags |= SDL_WINDOW_HIDDEN;
+     }
++#ifdef _WIN32
++    /* Disassociate the guest window's IME before it can receive focus. */
++    flags |= SDL_WINDOW_HIDDEN;
++#endif
+ #ifdef CONFIG_OPENGL
+     if (scon->opengl) {
+         flags |= SDL_WINDOW_OPENGL;
+@@ -117,6 +129,9 @@ void sdl2_window_create(struct sdl2_console *scon)
+                                          surface_width(scon->surface),
+                                          surface_height(scon->surface),
+                                          flags);
++#ifdef _WIN32
++    sdl2_win32_disable_ime(scon);
++#endif
+     if (scon->opengl) {
+         const char *driver = "opengl";
+ 
+@@ -152,6 +167,11 @@ void sdl2_window_create(struct sdl2_console *scon)
+ 
+     win_pinch_create(scon);
+     sdl_update_caption(scon);
++#ifdef _WIN32
++    if (!scon->hidden) {
++        SDL_ShowWindow(scon->real_window);
++    }
++#endif
+ }
+ 
+ void sdl2_window_destroy(struct sdl2_console *scon)
+@@ -174,6 +194,54 @@ void sdl2_window_destroy(struct sdl2_console *scon)
+     scon->real_window = NULL;
+ }
+ 
++#ifdef _WIN32
++static void sdl2_win32_disable_ime(struct sdl2_console *scon)
++{
++    SDL_SysWMinfo info = { 0 };
++
++    if (!scon->real_window || !qemu_console_is_graphic(scon->dcl.con)) {
++        return;
++    }
++
++    SDL_VERSION(&info.version);
++    if (SDL_GetWindowWMInfo(scon->real_window, &info)) {
++        /* SDL_StopTextInput alone may leave a newly created window's default
++         * input context associated, especially on secondary displays.
++         * The guest composes its own text from physical key events.
++         */
++        ImmAssociateContext(info.info.win.window, NULL);
++    }
++}
++
++static int sdl2_win32_text_input(void *opaque, SDL_Event *event)
++{
++    struct sdl2_console *scon;
++
++    if (event->type != SDL_WINDOWEVENT ||
++        event->window.event != SDL_WINDOWEVENT_FOCUS_GAINED) {
++        return 1;
++    }
++    scon = get_scon_from_window(event->window.windowID);
++    if (!scon || scon->real_window != SDL_GetKeyboardFocus()) {
++        return 1;
++    }
++
++    /* SDL sends FOCUS_GAINED before starting native text input for the new
++     * focus window. Act synchronously here: handling the queued event later
++     * can lose the first key to the Windows IME. QEMU's own text consoles
++     * still need SDL_TEXTINPUT; guest terminals use the virtual keyboard.
++     */
++    if (qemu_console_is_graphic(scon->dcl.con)) {
++        if (SDL_IsTextInputActive()) {
++            SDL_StopTextInput();
++        }
++    } else {
++        SDL_StartTextInput();
++    }
++    return 1;
++}
++#endif
++
+ void sdl2_window_resize(struct sdl2_console *scon)
+ {
+     if (!scon->real_window) {
+@@ -944,6 +1012,9 @@ static void sdl_mouse_define(DisplayChangeListener *dcl,
+ 
+ static void sdl_cleanup(void)
+ {
++#ifdef _WIN32
++    SDL_DelEventWatch(sdl2_win32_text_input, NULL);
++#endif
+     if (guest_sprite) {
+         SDL_FreeCursor(guest_sprite);
+     }
+@@ -1058,6 +1129,14 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
+         exit(1);
+     }
+ 
++#ifdef _WIN32
++    /* SDL2 enables text input by default on desktop platforms. Keep it off
++     * until a QEMU text console, rather than a graphical guest, gets focus.
++     */
++    SDL_StopTextInput();
++    SDL_AddEventWatch(sdl2_win32_text_input, NULL);
++#endif
++
+     /* Set EDID refresh rate to match the host monitor */
+     if (!qemu_edid_refresh_rate_mhz) {
+         SDL_DisplayMode mode;
